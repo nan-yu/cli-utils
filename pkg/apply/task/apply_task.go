@@ -10,17 +10,19 @@ import (
 	"io"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/resource"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/klog/v2"
 	"k8s.io/kubectl/pkg/cmd/apply"
 	cmddelete "k8s.io/kubectl/pkg/cmd/delete"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
+	"k8s.io/kubectl/pkg/util"
 
 	applyerror "sigs.k8s.io/cli-utils/pkg/apply/error"
 	"sigs.k8s.io/cli-utils/pkg/apply/event"
@@ -51,7 +53,6 @@ type ApplyTask struct {
 	TaskName string
 
 	DynamicClient     dynamic.Interface
-	OpenAPIGetter     discovery.OpenAPISchemaInterface
 	InfoHelper        info.Helper
 	Mapper            meta.RESTMapper
 	Objects           object.UnstructuredSet
@@ -152,15 +153,19 @@ func (a *ApplyTask) Start(taskContext *taskrunner.TaskContext) {
 			// Create a new instance of the applyOptions interface and use it
 			// to apply the objects.
 			ao := applyOptionsFactoryFunc(a.Name(), taskContext.EventChannel(),
-				a.ServerSideOptions, a.DryRunStrategy, a.DynamicClient, a.OpenAPIGetter)
+				a.ServerSideOptions, a.DryRunStrategy, a.DynamicClient)
 			ao.SetObjects([]*resource.Info{info})
 			klog.V(5).Infof("applying object: %v", id)
-			err = ao.Run()
-			if err != nil && a.ServerSideOptions.ServerSideApply && isAPIService(obj) && isStreamError(err) {
-				// Server-side Apply doesn't work with APIService before k8s 1.21
-				// https://github.com/kubernetes/kubernetes/issues/89264
-				// Thus APIService is handled specially using client-side apply.
-				err = a.clientSideApply(info, taskContext.EventChannel())
+			if mutationIgnored(*obj) {
+				err = applyMutationIgnoredObject(ao, info, a.ServerSideOptions.FieldManager)
+			} else {
+				err = ao.Run()
+				if err != nil && a.ServerSideOptions.ServerSideApply && isAPIService(obj) && isStreamError(err) {
+					// Server-side Apply doesn't work with APIService before k8s 1.21
+					// https://github.com/kubernetes/kubernetes/issues/89264
+					// Thus APIService is handled specially using client-side apply.
+					err = a.clientSideApply(info, taskContext.EventChannel())
+				}
 			}
 			if err != nil {
 				err = applyerror.NewApplyRunError(err)
@@ -183,9 +188,107 @@ func (a *ApplyTask) Start(taskContext *taskrunner.TaskContext) {
 	}()
 }
 
+func mutationIgnored(obj unstructured.Unstructured) bool {
+	if obj.GetAnnotations() == nil {
+		return false
+	}
+	value, ok := obj.GetAnnotations()[common.LifecycleMutationAnnotation]
+	return ok && value == common.IgnoreMutation
+}
+
+func applyMutationIgnoredObject(applyOpts applyOptions, info *resource.Info, fieldManager string) error {
+	helper := resource.NewHelper(info.Client, info.Mapping).
+		DryRun(false).
+		WithFieldManager(fieldManager)
+
+	ao, ok := applyOpts.(*apply.ApplyOptions)
+	if !ok {
+		return fmt.Errorf("expecting ApplyOptions type, but got %T", applyOpts)
+	}
+
+	if err := info.Get(); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return cmdutil.AddSourceToErr(fmt.Sprintf("retrieving current configuration of:\n%s\nfrom server for:", info.String()), info.Source, err)
+		}
+
+		// Create the resource if it doesn't exist
+		return createIgnoredObjectIfAbsent(ao, info, helper)
+	}
+
+	// Patch the resource based on the patchData if it already exists.
+	return patchIgnoredObject(ao, info, helper)
+}
+
+func createIgnoredObjectIfAbsent(ao *apply.ApplyOptions, info *resource.Info, helper *resource.Helper) error {
+	// First, update the annotation used by kubectl apply
+	if err := util.CreateApplyAnnotation(info.Object, unstructured.UnstructuredJSONScheme); err != nil {
+		return cmdutil.AddSourceToErr("creating", info.Source, err)
+	}
+	// Then create the resource and skip the three-way merge
+	obj, err := helper.Create(info.Namespace, true, info.Object)
+	if err != nil {
+		return cmdutil.AddSourceToErr("creating", info.Source, err)
+	}
+	info.Refresh(obj, true)
+
+	if err := ao.MarkObjectVisited(info); err != nil {
+		return err
+	}
+
+	return printObject(ao, info, "created")
+}
+
+func patchIgnoredObject(ao *apply.ApplyOptions, info *resource.Info, helper *resource.Helper) error {
+	if err := ao.MarkObjectVisited(info); err != nil {
+		return err
+	}
+
+	metadata, _ := meta.Accessor(info.Object)
+	annotationMap := metadata.GetAnnotations()
+
+	if annotationMap == nil {
+		return printObject(ao, info, "unchanged")
+	}
+	patchData, ok := annotationMap[common.IgnoreMutationPatchAnnotation]
+	if !ok || patchData == "" || patchData == "{}" {
+		return printObject(ao, info, "unchanged")
+	}
+
+	patchedObject, err := helper.Patch(
+		info.Namespace,
+		info.Name,
+		types.MergePatchType,
+		[]byte(patchData),
+		nil,
+	)
+
+	if err != nil {
+		return cmdutil.AddSourceToErr(fmt.Sprintf("applying patch:\n%s\nto:\n%v\nfor:", patchData, info), info.Source, err)
+	}
+
+	info.Refresh(patchedObject, true)
+
+	if metadata != nil && metadata.GetDeletionTimestamp() != nil {
+		// just warn the user about the conflict
+		klog.Warningf("Warning: Detected changes to resource %s/%s which is currently being deleted.", metadata.GetNamespace(), metadata.GetName())
+	}
+
+	return printObject(ao, info, "configured")
+}
+
+func printObject(ao *apply.ApplyOptions, info *resource.Info, message string) error {
+	printer, err := ao.ToPrinter(message)
+	if err != nil {
+		return err
+	}
+	if err = printer.PrintObj(info.Object, ao.Out); err != nil {
+		return err
+	}
+	return nil
+}
+
 func newApplyOptions(taskName string, eventChannel chan<- event.Event, serverSideOptions common.ServerSideOptions,
-	strategy common.DryRunStrategy, dynamicClient dynamic.Interface,
-	openAPIGetter discovery.OpenAPISchemaInterface) applyOptions {
+	strategy common.DryRunStrategy, dynamicClient dynamic.Interface) applyOptions {
 	emptyString := ""
 	return &apply.ApplyOptions{
 		VisitedNamespaces: sets.New[string](),
@@ -282,7 +385,7 @@ func isStreamError(err error) bool {
 }
 
 func (a *ApplyTask) clientSideApply(info *resource.Info, eventChannel chan<- event.Event) error {
-	ao := applyOptionsFactoryFunc(a.Name(), eventChannel, common.ServerSideOptions{ServerSideApply: false}, a.DryRunStrategy, a.DynamicClient, a.OpenAPIGetter)
+	ao := applyOptionsFactoryFunc(a.Name(), eventChannel, common.ServerSideOptions{ServerSideApply: false}, a.DryRunStrategy, a.DynamicClient)
 	ao.SetObjects([]*resource.Info{info})
 	return ao.Run()
 }

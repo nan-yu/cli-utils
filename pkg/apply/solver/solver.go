@@ -245,7 +245,6 @@ func (t *TaskQueueBuilder) newApplyTask(applyObjs object.UnstructuredSet,
 		ServerSideOptions: o.ServerSideOptions,
 		DryRunStrategy:    o.DryRunStrategy,
 		DynamicClient:     t.DynamicClient,
-		OpenAPIGetter:     t.OpenAPIGetter,
 		InfoHelper:        t.InfoHelper,
 		Mapper:            t.Mapper,
 	}

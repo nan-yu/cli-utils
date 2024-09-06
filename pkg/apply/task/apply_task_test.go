@@ -10,11 +10,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cli-runtime/pkg/resource"
-	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"sigs.k8s.io/cli-utils/pkg/apply/cache"
 	"sigs.k8s.io/cli-utils/pkg/apply/event"
@@ -87,7 +88,7 @@ func TestApplyTask_BasicAppliedObjects(t *testing.T) {
 
 			oldAO := applyOptionsFactoryFunc
 			applyOptionsFactoryFunc = func(string, chan<- event.Event, common.ServerSideOptions, common.DryRunStrategy,
-				dynamic.Interface, discovery.OpenAPISchemaInterface) applyOptions {
+				dynamic.Interface) applyOptions {
 				return &fakeApplyOptions{}
 			}
 			defer func() { applyOptionsFactoryFunc = oldAO }()
@@ -179,7 +180,7 @@ func TestApplyTask_FetchGeneration(t *testing.T) {
 
 			oldAO := applyOptionsFactoryFunc
 			applyOptionsFactoryFunc = func(string, chan<- event.Event, common.ServerSideOptions, common.DryRunStrategy,
-				dynamic.Interface, discovery.OpenAPISchemaInterface) applyOptions {
+				dynamic.Interface) applyOptions {
 				return &fakeApplyOptions{}
 			}
 			defer func() { applyOptionsFactoryFunc = oldAO }()
@@ -301,7 +302,7 @@ func TestApplyTask_DryRun(t *testing.T) {
 				ao := &fakeApplyOptions{}
 				oldAO := applyOptionsFactoryFunc
 				applyOptionsFactoryFunc = func(string, chan<- event.Event, common.ServerSideOptions, common.DryRunStrategy,
-					dynamic.Interface, discovery.OpenAPISchemaInterface) applyOptions {
+					dynamic.Interface) applyOptions {
 					return ao
 				}
 				defer func() { applyOptionsFactoryFunc = oldAO }()
@@ -450,7 +451,7 @@ func TestApplyTaskWithError(t *testing.T) {
 			ao := &fakeApplyOptions{}
 			oldAO := applyOptionsFactoryFunc
 			applyOptionsFactoryFunc = func(string, chan<- event.Event, common.ServerSideOptions, common.DryRunStrategy,
-				dynamic.Interface, discovery.OpenAPISchemaInterface) applyOptions {
+				dynamic.Interface) applyOptions {
 				return ao
 			}
 			defer func() { applyOptionsFactoryFunc = oldAO }()
@@ -512,6 +513,134 @@ func TestApplyTaskWithError(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyTaskWithIgnoreMutation(t *testing.T) {
+	testCases := map[string]struct {
+		objs            []*unstructured.Unstructured
+		expectedObjects []*unstructured.Unstructured
+		expectedEvents  []event.Event
+		expectedSkipped object.ObjMetadataSet
+		expectedFailed  object.ObjMetadataSet
+	}{
+		"objects created without ignore mutation": {
+			objs: []*unstructured.Unstructured{
+				toUnstructured(map[string]interface{}{
+					"apiVersion": "v1",
+					"kind":       "ConfigMap",
+					"metadata": map[string]interface{}{
+						"name":      "cm",
+						"namespace": "default",
+					},
+					"data": map[string]interface{}{
+						"foo": "bar",
+					},
+				}),
+			},
+			expectedObjects: []*unstructured.Unstructured{
+				toUnstructured(map[string]interface{}{
+					"apiVersion": "v1",
+					"kind":       "ConfigMap",
+					"metadata": map[string]interface{}{
+						"name":      "cm",
+						"namespace": "default",
+					},
+					"data": map[string]interface{}{
+						"foo": "bar",
+					},
+				}),
+			},
+		},
+		"objects created with ignore mutation":                             {},
+		"objects patched without ignore mutation":                          {},
+		"objects patched with ignore mutation":                             {},
+		"deleted objects get patched successfully without ignore mutation": {},
+		"deleted objects fail to be patched with ignore mutation":          {},
+	}
+
+	for tn, tc := range testCases {
+		drs := common.DryRunNone
+		t.Run(tn, func(t *testing.T) {
+			eventChannel := make(chan event.Event)
+			resourceCache := cache.NewResourceCacheMap()
+			taskContext := taskrunner.NewTaskContext(eventChannel, resourceCache)
+
+			cmGVK := corev1.SchemeGroupVersion.WithKind("ConfigMap")
+			restMapper := testutil.NewFakeRESTMapper(cmGVK)
+
+			ao := &fakeApplyOptions{}
+			oldAO := applyOptionsFactoryFunc
+			applyOptionsFactoryFunc = func(string, chan<- event.Event, common.ServerSideOptions, common.DryRunStrategy,
+				dynamic.Interface) applyOptions {
+				return ao
+			}
+			defer func() { applyOptionsFactoryFunc = oldAO }()
+
+			applyTask := &ApplyTask{
+				Objects:        tc.objs,
+				InfoHelper:     &fakeInfoHelper{},
+				Mapper:         restMapper,
+				DryRunStrategy: drs,
+			}
+
+			var events []event.Event
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for msg := range eventChannel {
+					events = append(events, msg)
+				}
+			}()
+
+			applyTask.Start(taskContext)
+			<-taskContext.TaskChannel()
+			close(eventChannel)
+			wg.Wait()
+
+			assert.Equal(t, len(tc.expectedObjects), len(ao.passedObjects))
+			appliedObjs := make([]*unstructured.Unstructured, len(ao.passedObjects))
+			for i, obj := range ao.passedObjects {
+				actual, err := runtimeObjToUnstructured(obj.Object)
+				appliedObjs[i] = actual
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tc.expectedObjects, appliedObjs)
+
+			assert.Equal(t, len(tc.expectedEvents), len(events))
+			for i, e := range events {
+				assert.Equal(t, tc.expectedEvents[i].Type, e.Type)
+				assert.Equal(t, tc.expectedEvents[i].ApplyEvent.Error.Error(), e.ApplyEvent.Error.Error())
+			}
+
+			applyIds := object.UnstructuredSetToObjMetadataSet(tc.objs)
+
+			im := taskContext.InventoryManager()
+
+			// validate record of failed prunes
+			for _, id := range tc.expectedFailed {
+				assert.Truef(t, im.IsFailedApply(id), "ApplyTask should mark object as failed: %s", id)
+			}
+			for _, id := range applyIds.Diff(tc.expectedFailed) {
+				assert.Falsef(t, im.IsFailedApply(id), "ApplyTask should NOT mark object as failed: %s", id)
+			}
+			// validate record of skipped prunes
+			for _, id := range tc.expectedSkipped {
+				assert.Truef(t, im.IsSkippedApply(id), "ApplyTask should mark object as skipped: %s", id)
+			}
+			for _, id := range applyIds.Diff(tc.expectedSkipped) {
+				assert.Falsef(t, im.IsSkippedApply(id), "ApplyTask should NOT mark object as skipped: %s", id)
+			}
+		})
+	}
+}
+
+func runtimeObjToUnstructured(obj runtime.Object) (*unstructured.Unstructured, error) {
+	un, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return nil, err
+	}
+	return toUnstructured(un), nil
 }
 
 func toUnstructured(obj map[string]interface{}) *unstructured.Unstructured {
